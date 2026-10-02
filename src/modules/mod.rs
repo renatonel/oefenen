@@ -14,7 +14,7 @@
 //! which modules exist, and a missing line is a compile error the moment
 //! someone tries to use the module.
 
-pub mod multiplication;
+pub mod tafels;
 
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use crate::profile::Profile;
 use crate::storage::ModuleStore;
 use crate::ui::hints::KeyHint;
 
-use self::multiplication::MultiplicationModule;
+use self::tafels::TafelsModule;
 
 /// Subject a module belongs to; used to group the module list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -203,23 +203,23 @@ impl Module for Box<dyn Module> {
 ///
 /// Adding a module means adding exactly one line here.
 pub fn registry() -> Vec<Box<dyn Module>> {
-    vec![Box::new(MultiplicationModule::default())]
+    vec![Box::new(TafelsModule::default())]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::multiplication::MULTIPLICATION_ID;
+    use crate::modules::tafels::TAFELS_ID;
     use crate::profile::{Grade, ProfileId};
     use crate::storage::ProfileStore;
     use tempfile::TempDir;
     use time::macros::datetime;
 
     #[test]
-    fn the_registry_contains_the_multiplication_module() {
+    fn the_registry_contains_the_tafels_module() {
         let modules = registry();
         let ids: Vec<&str> = modules.iter().map(|module| module.id()).collect();
-        assert_eq!(ids, vec![MULTIPLICATION_ID]);
+        assert_eq!(ids, vec![TAFELS_ID]);
     }
 
     #[test]
@@ -251,7 +251,7 @@ mod tests {
             )
             .unwrap();
         let id = profile.id().clone();
-        let module_store = ModuleStore::new(dir.path(), profile.id(), MULTIPLICATION_ID).unwrap();
+        let module_store = ModuleStore::new(dir.path(), profile.id(), TAFELS_ID).unwrap();
         let mut ctx = ModuleContext::new(profile, module_store);
         ctx.set_started_at(datetime!(2026-10-02 12:00 UTC));
 
@@ -259,7 +259,7 @@ mod tests {
         ctx.advance(Duration::from_millis(75));
         ctx.advance(Duration::from_millis(75));
         assert_eq!(ctx.elapsed_millis(), 150);
-        assert!(ctx.store().dir().ends_with(MULTIPLICATION_ID));
+        assert!(ctx.store().dir().ends_with(TAFELS_ID));
         assert_eq!(ctx.profile().id(), &id);
         assert_eq!(ctx.profile().name(), "Sem");
         assert_eq!(ProfileId::parse(id.as_str()).unwrap(), id);

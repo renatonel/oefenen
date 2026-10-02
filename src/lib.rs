@@ -8,7 +8,7 @@
 //! * [`event`] turns crossterm events into the application's own [`event::Event`].
 //! * [`storage`] reads and writes profiles, TOML and JSONL files.
 //! * [`modules`] contains the [`modules::Module`] contract, its context and the
-//!   registry, plus the first (dummy) module.
+//!   registry, plus the modules themselves.
 //! * [`ui`] draws the screens and the shared widgets.
 //! * [`i18n`] holds every Dutch string.
 //! * [`profile`] is the learner model.

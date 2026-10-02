@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use oefenen::app::{App, Screen};
 use oefenen::event::{Event, Key};
-use oefenen::modules::multiplication::{MULTIPLICATION_ID, SCHEMA_VERSION, SessionRecord};
+use oefenen::modules::tafels::TAFELS_ID;
+use oefenen::modules::tafels::records::{
+    ANSWERS_FILE, AnswerRecord, SCHEMA, SESSIONS_FILE, SessionRecord, SessionStatus,
+};
 use oefenen::modules::{ModuleContext, registry};
 use oefenen::profile::{Grade, Profile, ProfileId};
 use oefenen::storage::{self, ModuleStore, ProfileStore, StorageError};
@@ -144,7 +147,7 @@ fn jsonl_records_are_appended_and_read_back() {
     let data = Data::new();
     let store = data.profiles();
     let profile = store.create("Sem", Some(Grade::new(4).unwrap())).unwrap();
-    let module = ModuleStore::new(data.path(), profile.id(), MULTIPLICATION_ID).unwrap();
+    let module = ModuleStore::new(data.path(), profile.id(), TAFELS_ID).unwrap();
 
     #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
     struct Line {
@@ -175,20 +178,20 @@ fn module_storage_cannot_escape_its_directory() {
     }
 
     // The only module store that opens is the one inside the profile.
-    let module = ModuleStore::new(data.path(), profile.id(), MULTIPLICATION_ID).unwrap();
+    let module = ModuleStore::new(data.path(), profile.id(), TAFELS_ID).unwrap();
     assert!(
         module
             .dir()
             .starts_with(store.profile_dir(profile.id()).unwrap())
     );
-    assert!(module.dir().ends_with("modules/tafel-oefenen"));
+    assert!(module.dir().ends_with(format!("modules/{TAFELS_ID}")));
 }
 
 #[test]
-fn the_registry_returns_the_multiplication_module() {
+fn the_registry_returns_the_tafels_module() {
     let modules = registry();
     assert_eq!(modules.len(), 1);
-    assert_eq!(modules[0].id(), MULTIPLICATION_ID);
+    assert_eq!(modules[0].id(), TAFELS_ID);
     assert_eq!(modules[0].subject(), oefenen::modules::Subject::Math);
     assert!(!modules[0].title().is_empty());
     assert!(!modules[0].description().is_empty());
@@ -196,7 +199,7 @@ fn the_registry_returns_the_multiplication_module() {
 }
 
 #[test]
-fn the_dummy_module_lifecycle_writes_one_record() {
+fn a_whole_round_through_the_app_writes_answers_and_one_round_line() {
     let data = Data::new();
     let mut app = App::new(data.path(), TICK).unwrap();
     create(&mut app, "Sem");
@@ -206,35 +209,59 @@ fn the_dummy_module_lifecycle_writes_one_record() {
     key(&mut app, Key::Enter); // open the module
     assert_eq!(app.screen(), Screen::ModuleRunning);
 
-    // The timer runs on ticks.
+    // The clock runs on ticks, and the module sees the same counter.
     for _ in 0..4 {
         app.handle_event(&Event::Tick);
     }
     assert_eq!(app.context().unwrap().elapsed_millis(), 300);
 
+    // Table 7, "Beginnen", and the first time preset.
+    key(&mut app, Key::Char('7'));
+    key(&mut app, Key::End);
+    key(&mut app, Key::Enter);
+    key(&mut app, Key::Enter);
+    assert_eq!(
+        app.context().unwrap().elapsed_millis(),
+        300,
+        "de klok loopt door"
+    );
+
     for character in "56".chars() {
         key(&mut app, Key::Char(character));
     }
     key(&mut app, Key::Enter); // submit
-    key(&mut app, Key::Enter); // back to the list, storing the session
+    key(&mut app, Key::Esc); // ask before stopping
+    key(&mut app, Key::Esc); // "nee, doorgaan": the round carries on
+    key(&mut app, Key::Esc); // ask again
+    key(&mut app, Key::Right); // "ja, stoppen"
+    key(&mut app, Key::Enter); // the round ends, the results appear
+    key(&mut app, Key::Down); // "Terug naar het menu"
+    key(&mut app, Key::Down);
+    key(&mut app, Key::Enter);
     assert_eq!(app.screen(), Screen::ModuleList);
 
     let profile = &app.profiles()[0];
-    let module = ModuleStore::new(data.path(), profile.id(), MULTIPLICATION_ID).unwrap();
-    let records: Vec<SessionRecord> = module.read_records().unwrap();
+    let store = ModuleStore::new(data.path(), profile.id(), TAFELS_ID).unwrap();
 
-    assert_eq!(records.len(), 1, "precies één record geschreven");
-    let record = &records[0];
-    assert_eq!(record.schema_version, SCHEMA_VERSION);
-    assert_eq!(record.module_id, MULTIPLICATION_ID);
-    assert_eq!(record.duration_ms, 300);
-    assert_eq!(record.facts.len(), 1);
-    let fact = &record.facts[0];
-    assert_eq!(fact.factor_a, 7);
-    assert_eq!(fact.factor_b, 8);
-    assert!(fact.correct);
-    assert_eq!(fact.response_time_ms, 300);
-    assert!(fact.answered_at >= record.started_at);
+    // The answer reached the disk the moment it was submitted.
+    let answers: Vec<AnswerRecord> = store.read_from_lossy(ANSWERS_FILE);
+    assert_eq!(answers.len(), 1, "precies één antwoord geschreven");
+    assert_eq!(answers[0].schema, SCHEMA);
+    assert_eq!(answers[0].question_index, 0);
+    assert_eq!(answers[0].given, Some(56));
+    assert_eq!(
+        answers[0].outcome.is_correct(),
+        answers[0].given == Some(answers[0].question().expected()),
+        "de uitkomst klopt met het antwoord"
+    );
+
+    // And the round line follows when the round ends.
+    let rounds: Vec<SessionRecord> = store.read_from_lossy(SESSIONS_FILE);
+    assert_eq!(rounds.len(), 1, "precies één ronde geschreven");
+    assert_eq!(rounds[0].schema, SCHEMA);
+    assert_eq!(rounds[0].status, SessionStatus::Abandoned);
+    assert_eq!(rounds[0].settings.tables, vec![7]);
+    assert_eq!(rounds[0].question_count, 10);
 }
 
 #[test]
@@ -243,27 +270,50 @@ fn a_module_drives_its_own_context_without_a_terminal() {
     let data = Data::new();
     let store = data.profiles();
     let profile = store.create("Sem", Some(Grade::new(4).unwrap())).unwrap();
-    let module_store = ModuleStore::new(data.path(), profile.id(), MULTIPLICATION_ID).unwrap();
+    let module_store = ModuleStore::new(data.path(), profile.id(), TAFELS_ID).unwrap();
     let context = ModuleContext::new(profile, module_store);
 
     let mut module = registry().remove(0);
     let mut context = context;
     module.on_enter(&mut context);
+    let stay = oefenen::modules::Transition::Stay;
+
+    // The number keys pick tables, and "Beginnen" leads to the timer.
     assert_eq!(
-        module.handle_event(&Event::Key(Key::Char('5')), &mut context),
-        oefenen::modules::Transition::Stay
+        module.handle_event(&Event::Key(Key::Char('7')), &mut context),
+        stay
     );
     assert_eq!(
-        module.handle_event(&Event::Key(Key::Char('6')), &mut context),
-        oefenen::modules::Transition::Stay
+        module.handle_event(&Event::Key(Key::End), &mut context),
+        stay
     );
     assert_eq!(
         module.handle_event(&Event::Key(Key::Enter), &mut context),
-        oefenen::modules::Transition::Stay
+        stay
     );
-    // Escaping ends the session and is reported as an exit.
+    // The first preset starts the round.
+    assert_eq!(
+        module.handle_event(&Event::Key(Key::Enter), &mut context),
+        stay
+    );
+
+    for character in "56".chars() {
+        assert_eq!(
+            module.handle_event(&Event::Key(Key::Char(character)), &mut context),
+            stay
+        );
+    }
+    assert_eq!(
+        module.handle_event(&Event::Key(Key::Enter), &mut context),
+        stay
+    );
+    // A running round cannot be left by Esc, and Ctrl-C always can.
     assert_eq!(
         module.handle_event(&Event::Key(Key::Esc), &mut context),
+        stay
+    );
+    assert_eq!(
+        module.handle_event(&Event::Key(Key::CtrlC), &mut context),
         oefenen::modules::Transition::Exit
     );
     module.on_exit(&mut context);
@@ -271,13 +321,14 @@ fn a_module_drives_its_own_context_without_a_terminal() {
     let module_store = ModuleStore::new(
         data.path(),
         &ProfileId::parse(context.profile().id().as_str()).unwrap(),
-        MULTIPLICATION_ID,
+        TAFELS_ID,
     )
     .unwrap();
-    let records = module_store.read_records::<SessionRecord>().unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].facts.len(), 1);
-    assert!(records[0].facts[0].correct);
+    let rounds: Vec<SessionRecord> = module_store.read_from_lossy(SESSIONS_FILE);
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0].status, SessionStatus::Abandoned);
+    let answers: Vec<AnswerRecord> = module_store.read_from_lossy(ANSWERS_FILE);
+    assert_eq!(answers.len(), 1);
 }
 
 #[test]
@@ -287,18 +338,23 @@ fn two_profiles_keep_their_own_results() {
     create(&mut app, "Sem");
     create(&mut app, "Jan");
 
-    // Play one session as the learner under the cursor.
+    // Play one round as the learner under the cursor.
     key(&mut app, Key::Enter);
     key(&mut app, Key::Enter);
-    key(&mut app, Key::Esc);
+    key(&mut app, Key::Char('7'));
+    key(&mut app, Key::End);
+    key(&mut app, Key::Enter);
+    key(&mut app, Key::Enter);
+    key(&mut app, Key::CtrlC);
+    assert_eq!(app.screen(), Screen::ModuleList);
 
     let counts: Vec<u64> = app
         .profiles()
         .iter()
         .map(|profile: &Profile| {
-            ModuleStore::new(data.path(), profile.id(), MULTIPLICATION_ID)
+            ModuleStore::new(data.path(), profile.id(), TAFELS_ID)
                 .unwrap()
-                .record_count()
+                .count_in(SESSIONS_FILE)
         })
         .collect();
     assert_eq!(counts, vec![1, 0]);

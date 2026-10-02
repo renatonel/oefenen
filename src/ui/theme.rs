@@ -29,6 +29,12 @@ pub const ERROR: Color = Color::Rgb(255, 122, 122);
 pub const HIGHLIGHT_BG: Color = Color::Rgb(44, 56, 90);
 /// Timer digits.
 pub const TIMER: Color = Color::Rgb(129, 214, 255);
+/// Timer while more than half of the time is left.
+pub const TIMER_OK: Color = Color::Rgb(126, 231, 135);
+/// Timer once half of the time is gone.
+pub const TIMER_WARN: Color = Color::Rgb(255, 189, 68);
+/// Timer at the last quarter: also bold, so the colour is never the only cue.
+pub const TIMER_CRITICAL: Color = Color::Rgb(255, 95, 95);
 
 /// Base style for the whole frame.
 pub fn base() -> Style {
@@ -67,6 +73,30 @@ pub fn input() -> Style {
 /// Style for the running timer.
 pub fn timer() -> Style {
     base().fg(TIMER).add_modifier(Modifier::BOLD)
+}
+
+/// Style for a countdown with plenty of time left.
+pub fn timer_ok() -> Style {
+    base().fg(TIMER_OK).add_modifier(Modifier::BOLD)
+}
+
+/// Style for a countdown that has used up half of its time.
+pub fn timer_warn() -> Style {
+    base().fg(TIMER_WARN).add_modifier(Modifier::BOLD)
+}
+
+/// Style for a countdown in its last quarter.
+///
+/// Bold on purpose: at this stage the colour alone would carry the warning, and
+/// colour on its own is not accessible.
+pub fn timer_critical() -> Style {
+    base().fg(TIMER_CRITICAL).add_modifier(Modifier::BOLD)
+}
+
+/// The empty part of a gauge, and anything else that must not compete with the
+/// coloured part next to it.
+pub fn meter_track() -> Style {
+    base().fg(BORDER)
 }
 
 /// Style for a panel: background and border.
@@ -116,6 +146,17 @@ pub fn error() -> Style {
     base().fg(ERROR).add_modifier(Modifier::BOLD)
 }
 
+/// Style for a correct answer, named after what it means rather than its
+/// colour. Same green as [`success`], so it reads as one system.
+pub fn feedback_correct() -> Style {
+    success()
+}
+
+/// Style for a wrong or too-late answer. Same red as [`error`].
+pub fn feedback_wrong() -> Style {
+    error()
+}
+
 /// Style for the key of a key hint.
 pub fn hint_key() -> Style {
     base()
@@ -142,6 +183,10 @@ mod tests {
             ("question", question()),
             ("input", input()),
             ("timer", timer()),
+            ("timer_ok", timer_ok()),
+            ("timer_warn", timer_warn()),
+            ("timer_critical", timer_critical()),
+            ("meter_track", meter_track()),
             ("panel", panel()),
             ("title", title()),
             ("heading", heading()),
@@ -150,6 +195,8 @@ mod tests {
             ("disabled", disabled()),
             ("success", success()),
             ("error", error()),
+            ("feedback_correct", feedback_correct()),
+            ("feedback_wrong", feedback_wrong()),
             ("hint_key", hint_key()),
             ("hint_label", hint_label()),
         ]
@@ -176,6 +223,9 @@ mod tests {
             ERROR,
             HIGHLIGHT_BG,
             TIMER,
+            TIMER_OK,
+            TIMER_WARN,
+            TIMER_CRITICAL,
         ];
         for (name, style) in all_styles() {
             for colour in [style.bg, style.fg].into_iter().flatten() {
@@ -193,5 +243,24 @@ mod tests {
         assert_eq!(error().fg, Some(ERROR));
         assert_eq!(success().fg, Some(SUCCESS));
         assert_ne!(success().fg, error().fg);
+        assert_eq!(feedback_correct(), success());
+        assert_eq!(feedback_wrong(), error());
+    }
+
+    #[test]
+    fn the_timer_stages_go_from_green_through_yellow_to_red() {
+        let stages = [timer_ok(), timer_warn(), timer_critical()];
+        assert_eq!(stages[0].fg, Some(TIMER_OK));
+        assert_eq!(stages[1].fg, Some(TIMER_WARN));
+        assert_eq!(stages[2].fg, Some(TIMER_CRITICAL));
+        // Every stage differs from the next, so the colour is a real cue and
+        // not just a shade of the same red.
+        assert_ne!(stages[0].fg, stages[1].fg);
+        assert_ne!(stages[1].fg, stages[2].fg);
+        assert_ne!(stages[0].fg, stages[2].fg);
+        // All three are bold: the red stage is not carried by colour alone.
+        for style in stages {
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+        }
     }
 }

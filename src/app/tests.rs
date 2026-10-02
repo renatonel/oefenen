@@ -7,7 +7,10 @@ use tempfile::TempDir;
 use crate::app::{App, ConfirmChoice, Field, FormMode, Screen};
 use crate::event::{Event, Key};
 use crate::modules::Subject;
-use crate::modules::multiplication::{MULTIPLICATION_ID, SessionRecord};
+use crate::modules::tafels::TAFELS_ID;
+use crate::modules::tafels::records::{
+    ANSWERS_FILE, AnswerRecord, Outcome, SESSIONS_FILE, SessionRecord, SessionStatus,
+};
 use crate::profile::{Grade, ProfileId};
 use crate::storage::{ModuleStore, ProfileStore};
 
@@ -71,15 +74,55 @@ impl Fixture {
         assert_eq!(self.app().screen(), Screen::ModuleList);
     }
 
-    /// Runs one multiplication session and leaves it again.
-    fn play_session(&mut self, answer: &str) {
+    /// Opens the tafels module, picks table 7 and the default time.
+    fn start_round(&mut self) {
         self.enter();
         assert_eq!(self.app().screen(), Screen::ModuleRunning);
+        // Start from a known list: the choices are remembered between visits, so
+        // "7" would switch the table off on the second round.
+        self.key(Key::Char('u'));
+        self.key(Key::Char('7'));
+        self.key(Key::End);
+        self.enter();
+        // The first time row is five seconds per question.
+        self.enter();
+    }
+
+    /// Runs one tafels round: chooses table 7, answers once and stops.
+    fn play_round(&mut self, answer: &str) {
+        self.start_round();
         for character in answer.chars() {
             self.key(Key::Char(character));
         }
         self.enter();
+        self.stop_round();
+    }
+
+    /// Answers "ja, stoppen" to the stop question Esc opens.
+    ///
+    /// Esc on its own only asks the question, and the answer starts on "nee,
+    /// doorgaan", so a second Esc would carry on instead.
+    fn stop_round(&mut self) {
         self.key(Key::Esc);
+        self.key(Key::Right);
+        self.enter();
+    }
+
+    /// Leaves the results screen for the module list, like a learner would.
+    fn leave_results(&mut self) {
+        // Opnieuw, Andere instellingen, Terug naar menu.
+        self.key(Key::Down);
+        self.key(Key::Down);
+        self.enter();
+        assert_eq!(self.app().screen(), Screen::ModuleList);
+    }
+
+    /// How many of the written answers were right.
+    fn correct(&self, name: &str) -> usize {
+        self.answers(name)
+            .iter()
+            .filter(|answer| answer.outcome == Outcome::Correct)
+            .count()
     }
 
     fn profile_id(&self, name: &str) -> ProfileId {
@@ -92,11 +135,19 @@ impl Fixture {
             .clone()
     }
 
-    /// Reads back the multiplication records of one learner.
+    /// The tafels storage of one learner.
+    fn store(&self, name: &str) -> ModuleStore {
+        ModuleStore::new(self.dir.path(), &self.profile_id(name), TAFELS_ID).unwrap()
+    }
+
+    /// The finished rounds of one learner.
     fn records(&self, name: &str) -> Vec<SessionRecord> {
-        let store =
-            ModuleStore::new(self.dir.path(), &self.profile_id(name), MULTIPLICATION_ID).unwrap();
-        store.read_records().unwrap()
+        self.store(name).read_from_lossy(SESSIONS_FILE)
+    }
+
+    /// The answers of one learner, one record per question.
+    fn answers(&self, name: &str) -> Vec<AnswerRecord> {
+        self.store(name).read_from_lossy(ANSWERS_FILE)
     }
 }
 
@@ -430,62 +481,104 @@ fn opening_and_leaving_a_module_walks_through_module_running() {
 }
 
 #[test]
-fn the_module_lifecycle_writes_exactly_one_record() {
+fn the_module_lifecycle_writes_exactly_one_round() {
     let mut fixture = Fixture::with_profiles(&["Sem"]);
     fixture.select_current_profile();
+    fixture.start_round();
 
-    fixture.enter();
     fixture.tick(8);
     for character in "56".chars() {
         fixture.key(Key::Char(character));
     }
     fixture.enter();
-    // Feedback is showing; the next Enter goes back to the list and stores.
-    fixture.enter();
-    assert_eq!(fixture.app().screen(), Screen::ModuleList);
+    assert_eq!(
+        fixture.answers("Sem").len(),
+        1,
+        "het antwoord staat er meteen"
+    );
+    assert!(fixture.records("Sem").is_empty(), "de ronde loopt nog");
+
+    // Esc asks before it stops, and the answer starts on "nee, doorgaan", so
+    // cancelling leaves the round exactly where it was.
+    fixture.key(Key::Esc);
+    fixture.key(Key::Esc);
+    assert!(fixture.records("Sem").is_empty(), "afgebroken telt niet");
+
+    fixture.stop_round();
+    fixture.leave_results();
 
     let records = fixture.records("Sem");
     assert_eq!(records.len(), 1, "precies één regel geschreven");
     let record = &records[0];
-    assert_eq!(record.module_id, MULTIPLICATION_ID);
-    assert_eq!(record.schema_version, 1);
-    assert_eq!(record.duration_ms, 600);
-    assert_eq!(record.facts.len(), 1);
-    let fact = &record.facts[0];
-    assert_eq!((fact.factor_a, fact.factor_b), (7, 8));
-    assert!(fact.correct);
-    assert_eq!(fact.response_time_ms, 600);
-    assert!(fact.answered_at >= record.started_at);
+    assert_eq!(record.schema, 1);
+    assert_eq!(record.status, SessionStatus::Abandoned);
+    assert_eq!(record.settings.tables, vec![7]);
+    assert_eq!(record.question_count, 10);
+    // The round was stopped after one question, so only that one was written.
+    assert_eq!(record.correct_count, fixture.correct("Sem"));
+    assert_eq!(fixture.answers("Sem").len(), 1);
+
+    // The clock counts ticks, and the verdict pauses it.
+    assert!(record.total_ms > 0, "{record:?}");
 }
 
 #[test]
 fn a_wrong_answer_is_recorded_as_incorrect() {
     let mut fixture = Fixture::with_profiles(&["Sem"]);
     fixture.select_current_profile();
-    fixture.enter();
+    fixture.start_round();
     fixture.tick(2);
+
+    // Ten is not in table seven, so this is wrong whichever question comes up.
     for character in "10".chars() {
         fixture.key(Key::Char(character));
     }
     fixture.enter();
-    fixture.key(Key::Esc);
+    fixture.stop_round();
 
-    let records = fixture.records("Sem");
-    assert_eq!(records.len(), 1);
-    assert!(!records[0].facts[0].correct);
-    assert_eq!(records[0].duration_ms, 150);
+    let answers = fixture.answers("Sem");
+    assert_eq!(answers.len(), 1);
+    assert_ne!(answers[0].outcome, Outcome::Correct);
+    assert!(answers[0].outcome.is_wrong(), "{:?}", answers[0].outcome);
+    assert_eq!(answers[0].given, Some(10));
+    assert_eq!(answers[0].question_index, 0);
 }
 
 #[test]
-fn leaving_a_module_immediately_still_writes_a_record() {
+fn leaving_the_module_still_writes_the_questions_that_were_asked() {
     let mut fixture = Fixture::with_profiles(&["Sem"]);
     fixture.select_current_profile();
+    fixture.start_round();
+    for character in "56".chars() {
+        fixture.key(Key::Char(character));
+    }
     fixture.enter();
-    fixture.key(Key::Esc);
 
+    // Ctrl-C stops the round and leaves the module at once.
+    assert!(!fixture.app().should_quit());
+    fixture.key(Key::CtrlC);
+    assert_eq!(fixture.app().screen(), Screen::ModuleList);
+
+    // The answer reached the disk before the module was closed, and the round
+    // is written as abandoned.
+    assert_eq!(fixture.answers("Sem").len(), 1);
     let records = fixture.records("Sem");
     assert_eq!(records.len(), 1);
-    assert!(records[0].facts.is_empty());
+    assert_eq!(records[0].status, SessionStatus::Abandoned);
+    assert_eq!(records[0].correct_count, fixture.correct("Sem"));
+}
+
+#[test]
+fn a_round_that_was_never_started_writes_nothing() {
+    let mut fixture = Fixture::with_profiles(&["Sem"]);
+    fixture.select_current_profile();
+
+    // The table screen can be left without choosing anything at all.
+    fixture.enter();
+    fixture.key(Key::Esc);
+    assert_eq!(fixture.app().screen(), Screen::ModuleList);
+    assert!(fixture.records("Sem").is_empty());
+    assert!(fixture.answers("Sem").is_empty());
 }
 
 #[test]
@@ -493,7 +586,8 @@ fn each_visit_is_its_own_session() {
     let mut fixture = Fixture::with_profiles(&["Sem"]);
     fixture.select_current_profile();
     for _ in 0..2 {
-        fixture.play_session("56");
+        fixture.play_round("56");
+        fixture.leave_results();
     }
     let records = fixture.records("Sem");
     assert_eq!(records.len(), 2);
@@ -509,10 +603,16 @@ fn results_are_stored_per_profile() {
         fixture.app().active_profile().map(|p| p.name()),
         Some("Jan")
     );
-    fixture.play_session("56");
+    fixture.play_round("56");
     assert_eq!(fixture.records("Jan").len(), 1);
+    fixture.leave_results();
 
     // Switch learner: the other profile has its own, empty, storage.
+    fixture.key(Key::Down);
+    fixture.key(Key::Down);
+    fixture.enter();
+    fixture.key(Key::Esc);
+    assert_eq!(fixture.app().screen(), Screen::ModuleList);
     fixture.key(Key::Esc);
     fixture.key(Key::Down);
     fixture.select_current_profile();
@@ -530,7 +630,7 @@ fn the_registry_is_visible_from_the_module_list() {
     fixture.select_current_profile();
     let modules = fixture.app().modules();
     assert_eq!(modules.len(), 1);
-    assert_eq!(modules[0].id(), MULTIPLICATION_ID);
+    assert_eq!(modules[0].id(), TAFELS_ID);
     assert_eq!(modules[0].subject(), Subject::Math);
     assert!(!modules[0].title().is_empty());
     assert!(!modules[0].description().is_empty());
