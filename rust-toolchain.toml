@@ -1,0 +1,4 @@
+[toolchain]
+# Stable 1.85 is the first release with support for the 2024 edition.
+channel = "stable"
+components = ["rustfmt", "clippy"]
