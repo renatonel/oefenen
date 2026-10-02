@@ -57,10 +57,12 @@ pub fn label() -> Style {
 }
 
 /// Style for a question: large and bold.
+///
+/// No underline here, and that is not an oversight: the question is drawn as a
+/// block font, so an underline would put a rule across every one of its rows and
+/// the digits would read as if they were printed on ruled paper.
 pub fn question() -> Style {
-    base()
-        .fg(ACCENT)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    base().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
 /// Style for what the learner types.
@@ -245,6 +247,18 @@ mod tests {
         assert_ne!(success().fg, error().fg);
         assert_eq!(feedback_correct(), success());
         assert_eq!(feedback_wrong(), error());
+    }
+
+    #[test]
+    fn the_question_style_draws_no_line_across_the_digits() {
+        // The question is a block font. `UNDERLINED` or `CROSSED_OUT` would draw
+        // a rule through every row of it, which is unreadable for a child.
+        let question = question();
+        assert!(!question.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(!question.add_modifier.contains(Modifier::CROSSED_OUT));
+        // It still has to stand out from the plain text around it.
+        assert!(question.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(question.fg, Some(ACCENT));
     }
 
     #[test]

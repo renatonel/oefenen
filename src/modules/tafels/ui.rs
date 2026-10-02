@@ -835,6 +835,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use time::macros::datetime;
 
+    use crate::modules::tafels::bigfont::Scale;
     use crate::modules::tafels::session::{FEEDBACK_MS, SystemShuffler};
     use crate::modules::tafels::settings::MAX_CUSTOM_DIGITS;
     use crate::modules::tafels::timer::TimerMode;
@@ -859,6 +860,42 @@ mod tests {
             })
             .collect::<Vec<String>>()
             .join("\n")
+    }
+
+    /// Draws one frame and returns the modifiers on every cell inside the panel.
+    ///
+    /// [`draw`] only looks at characters, so it cannot see a style that adds a
+    /// line: an underline leaves no character behind to fail on.
+    fn draw_modifiers(
+        width: u16,
+        height: u16,
+        paint: impl FnOnce(&mut Frame, Rect),
+    ) -> Vec<Modifier> {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("testbackend werkt");
+        terminal
+            .draw(|frame| paint(frame, frame.area()))
+            .expect("tekenen lukt");
+        let buffer = terminal.backend().buffer().clone();
+        let last = buffer.area.width.saturating_sub(1);
+        let cells: Vec<Modifier> = (0..buffer.area.height)
+            .flat_map(|y| {
+                (1..last)
+                    .map(|x| buffer[(x, y)].modifier)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        cells
+    }
+
+    /// The modifiers in force on every cell of the drawn question.
+    fn question_modifiers(session: &Session, now_ms: u64) -> Vec<Modifier> {
+        draw_modifiers(80, 24, |frame, area| {
+            render_session(frame, area, session, now_ms)
+        })
+        .into_iter()
+        .filter(|modifier| modifier.contains(Modifier::BOLD))
+        .collect()
     }
 
     /// Whether `text` holds `needle`, however the terminal wrapped it.
@@ -990,6 +1027,30 @@ mod tests {
             render_session(frame, area, &session, 0)
         });
         assert!(text.contains(tafels::QUESTION_TOO_SMALL), "{text}");
+    }
+
+    #[test]
+    fn the_question_is_not_drawn_over_horizontal_rules() {
+        // The block font is drawn one line per glyph row, and an underline
+        // paints a rule under every one of them: the digits end up looking
+        // printed on ruled paper, which is what a learner complained about.
+        let session = session();
+        assert_eq!(
+            question_layout(78, 22),
+            QuestionLayout::Big(Scale { rows: 1, cols: 1 })
+        );
+        let modifiers = question_modifiers(&session, 0);
+        assert!(!modifiers.is_empty(), "de vraag is getekend");
+        for modifier in modifiers {
+            assert!(
+                !modifier.contains(Modifier::UNDERLINED),
+                "een streep onder de vraag: {modifier:?}"
+            );
+            assert!(
+                !modifier.contains(Modifier::CROSSED_OUT),
+                "een streep door de vraag: {modifier:?}"
+            );
+        }
     }
 
     #[test]
