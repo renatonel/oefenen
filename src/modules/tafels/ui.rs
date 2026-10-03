@@ -1013,10 +1013,33 @@ mod tests {
             render_session(frame, area, &session, 110)
         });
 
-        // The answer they typed is still there, not an empty line.
-        assert!(text.contains("7 × 6 = 9"), "{text}");
+        // The answer they typed is still there, not an empty line, and it sits
+        // next to the equation they answered: the next question is not on screen
+        // until the verdict has been up long enough.
+        assert!(
+            text.contains(&format!("{} = 9", question.label())),
+            "{text}"
+        );
         assert!(text.contains(&question.expected().to_string()), "{text}");
         assert!(text.contains(tafels::OUTCOME_INCORRECT), "{text}");
+        // The position in the round still names the question being judged.
+        assert!(text.contains(&tafels::question_of(0, 36)), "{text}");
+    }
+
+    #[test]
+    fn the_countdown_stands_still_while_the_verdict_is_up() {
+        let mut session = session();
+        session.on_key(&Key::Char('9'), 3_000);
+        session.on_key(&Key::Enter, 3_000);
+        let answering = draw(60, 16, |frame, area| {
+            render_session(frame, area, &session, 3_000)
+        });
+
+        // Well into the verdict: same equation, same verdict, same clock.
+        let reading = draw(60, 16, |frame, area| {
+            render_session(frame, area, &session, 3_000 + FEEDBACK_MS - 1)
+        });
+        assert_eq!(reading, answering, "het scherm staat stil tijdens de pauze");
     }
 
     #[test]

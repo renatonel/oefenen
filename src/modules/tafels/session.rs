@@ -19,7 +19,7 @@
 //!
 //! Time is measured with [`Active`], which stops counting while a feedback pause
 //! is on screen. A countdown therefore never costs the learner the second and a
-//! half they are reading the correct answer, and the stored duration is the time
+//! bit they are reading the correct answer, and the stored duration is the time
 //! actually spent answering.
 
 use rand::SeedableRng;
@@ -139,8 +139,17 @@ impl Active {
 pub enum Phase {
     /// The question is on screen and the answer is being typed.
     Running,
-    /// The question is resolved; the verdict is on screen.
-    Feedback { outcome: Outcome },
+    /// The question is resolved and the verdict is on screen.
+    ///
+    /// It carries the question and what was submitted for it, so the whole
+    /// screen keeps showing one coherent thing: the equation that was answered,
+    /// the answer that was given, and a clock that has stopped where it was.
+    /// The next question is not built until this phase ends.
+    Feedback {
+        outcome: Outcome,
+        question: Question,
+        submitted: Option<u32>,
+    },
     /// Nothing left to answer; the results screen takes over.
     Done,
 }
@@ -209,21 +218,21 @@ pub struct Session {
     /// Every question, shuffled; each one is asked exactly once.
     questions: Vec<Question>,
     /// Index of the question on screen; equal to the number already resolved.
+    ///
+    /// It only moves on when the verdict ends, so during the pause the screen
+    /// still shows the question that was just answered.
     cursor: usize,
     /// One record per resolved question, in the order they were asked.
     answers: Vec<AnswerRecord>,
     phase: Phase,
     input: String,
-    /// What the learner submitted for the question now being judged, kept while
-    /// the verdict is on screen: the typed digits are cleared, but the question
-    /// and its answer have to stay readable next to the feedback.
-    submitted: Option<u32>,
     timer: Timer,
     active: Active,
     /// When the question on screen appeared, for its response time and its own
     /// countdown.
     question_shown_ms: u64,
-    /// When the verdict appeared, for the length of the pause.
+    /// When the verdict appeared, for the length of the pause and to hold the
+    /// per-question clock still while it is up.
     feedback_started_ms: u64,
     /// Wall-clock start, so records carry real timestamps.
     started_at: OffsetDateTime,
@@ -269,7 +278,6 @@ impl Session {
             answers: Vec::new(),
             phase: Phase::Running,
             input: String::new(),
-            submitted: None,
             timer: Timer::new(settings.timer_mode, settings.seconds),
             active: Active {
                 accumulated_ms: 0,
@@ -353,7 +361,7 @@ impl Session {
     /// The outcome on screen, if the verdict is up.
     pub fn feedback_outcome(&self) -> Option<Outcome> {
         match self.phase {
-            Phase::Feedback { outcome } => Some(outcome),
+            Phase::Feedback { outcome, .. } => Some(outcome),
             _ => None,
         }
     }
@@ -366,13 +374,25 @@ impl Session {
     /// Milliseconds that count against the timer right now.
     ///
     /// The per-question mode measures the current question, the other modes the
-    /// whole session. Feedback pauses are excluded from both.
+    /// whole session. The verdict pause is excluded from all three: the screen
+    /// stands still while the learner reads, and the timer on it stands still
+    /// too.
     pub fn timer_elapsed_ms(&self, now_ms: u64) -> u64 {
         match self.timer.mode() {
             // A per-question clock is restarted every question, so it is simply
-            // the age of the question on screen.
-            TimerMode::PerQuestion => now_ms.saturating_sub(self.question_shown_ms),
-            // The total clock and the stopwatch run over the whole session.
+            // the age of the question on screen. While the verdict is up that
+            // question is the one being judged, and its clock is held at the
+            // moment it was resolved, so the countdown does not run on
+            // underneath the answer. It is the same value recorded as the
+            // response time, which is what makes the screen self-consistent.
+            TimerMode::PerQuestion => match self.phase {
+                Phase::Feedback { .. } => self
+                    .feedback_started_ms
+                    .saturating_sub(self.question_shown_ms),
+                _ => now_ms.saturating_sub(self.question_shown_ms),
+            },
+            // The total clock and the stopwatch run over the whole session, and
+            // `active` is already paused for the verdict.
             TimerMode::Total | TimerMode::None => self.active.elapsed_ms(now_ms),
         }
     }
@@ -419,12 +439,20 @@ impl Session {
     /// cursor. During the verdict the same spot shows what was submitted, next
     /// to the question it belongs to.
     pub fn question_text(&self) -> String {
-        let Some(question) = self.current() else {
-            return String::new();
-        };
         match self.phase {
-            Phase::Feedback { .. } => format!("{} = {}", question.label(), self.submitted_text()),
-            _ => format!("{} = {}{}", question.label(), self.input, bigfont::CURSOR),
+            Phase::Feedback {
+                question,
+                submitted,
+                ..
+            } => {
+                format!("{} = {}", question.label(), Self::submitted_text(submitted))
+            }
+            _ => {
+                let Some(question) = self.current() else {
+                    return String::new();
+                };
+                format!("{} = {}{}", question.label(), self.input, bigfont::CURSOR)
+            }
         }
     }
 
@@ -432,8 +460,8 @@ impl Session {
     ///
     /// A question that ran out of time has no answer to show, which is drawn as
     /// a dash so the verdict has something to sit next to.
-    fn submitted_text(&self) -> String {
-        match self.submitted {
+    fn submitted_text(submitted: Option<u32>) -> String {
+        match submitted {
             Some(given) => given.to_string(),
             None => "-".to_string(),
         }
@@ -561,34 +589,33 @@ impl Session {
             self.end_feedback(now_ms);
         }
         self.finish(SessionStatus::Completed, now_ms);
-        while let Some(question) = self.current() {
-            self.record(question, None, Outcome::NotReached, None);
+        // Whatever is left behind the cursor was never asked, but it does belong
+        // in the log, each under its own question number.
+        while let Some(question) = self.questions.get(self.cursor).copied() {
+            let record = self.build_record(question, None, Outcome::NotReached, None);
+            self.answers.push(record.clone());
+            self.pending.push(record);
+            self.cursor = self.cursor.saturating_add(1);
         }
     }
 
     // --- resolving a question ---------------------------------------------
 
-    /// Records one question the learner never saw and moves on.
-    fn record(
-        &mut self,
-        question: Question,
-        given: Option<u32>,
-        outcome: Outcome,
-        response_ms: Option<u64>,
-    ) {
-        let record = self.build_record(question, given, outcome, response_ms);
-        self.answers.push(record.clone());
-        self.pending.push(record);
-        self.cursor = self.cursor.saturating_add(1);
-    }
-
     /// Records one question and shows the verdict.
     fn resolve(&mut self, question: Question, given: Option<u32>, outcome: Outcome, now_ms: u64) {
         let response_ms = now_ms.saturating_sub(self.question_shown_ms);
-        self.record(question, given, outcome, Some(response_ms));
-        self.submitted = given;
+        let record = self.build_record(question, given, outcome, Some(response_ms));
+        self.answers.push(record.clone());
+        self.pending.push(record);
         self.input.clear();
-        self.phase = Phase::Feedback { outcome };
+        // The question and the answer go into the phase, because the typed digits
+        // are cleared while the verdict is up and the two still have to stay
+        // readable next to it.
+        self.phase = Phase::Feedback {
+            outcome,
+            question,
+            submitted: given,
+        };
         self.feedback_started_ms = now_ms;
         // The learner is reading, not answering: the clock waits for them.
         self.active.pause(now_ms);
@@ -628,14 +655,19 @@ impl Session {
 
     /// Leaves the feedback pause, either with the next question or with the
     /// results screen.
+    ///
+    /// This is the only place the cursor moves, so the pause is exactly the
+    /// window in which the answered question stays on screen.
     fn end_feedback(&mut self, now_ms: u64) {
+        self.cursor = self.cursor.saturating_add(1);
         if self.cursor >= self.questions.len() {
             self.finish(SessionStatus::Completed, now_ms);
             return;
         }
         self.phase = Phase::Running;
         self.input.clear();
-        self.submitted = None;
+        // The next question starts its own countdown from here, not from where
+        // the one just answered stopped.
         self.question_shown_ms = now_ms;
         self.active.resume(now_ms);
     }
@@ -650,7 +682,6 @@ impl Session {
         self.ended_ms = Some(now_ms);
         self.phase = Phase::Done;
         self.input.clear();
-        self.submitted = None;
     }
 
     /// Stops the session early, because the learner asked to.
@@ -759,16 +790,19 @@ mod tests {
         let mut session = session(&table_settings(TimerMode::None, 10));
         let submitted = answer(&mut session, 0, 7);
 
+        let q = session.questions[0];
         assert_eq!(
             session.phase(),
             Phase::Feedback {
-                outcome: Outcome::Correct
+                outcome: Outcome::Correct,
+                question: q,
+                submitted: Some(7)
             }
         );
         assert_eq!(session.correct_count(), 1);
-        assert_eq!(session.cursor(), 1);
-        // The typed answer stays on screen next to the equation.
-        assert_eq!(session.question_text(), "7 × 2 = 7");
+        assert_eq!(session.cursor(), 0);
+        // The typed answer stays on screen next to the equation that was just answered.
+        assert_eq!(session.question_text(), "7 × 1 = 7");
 
         let records = session.take_pending();
         assert_eq!(records.len(), 1);
@@ -787,10 +821,13 @@ mod tests {
         let mut session = session(&table_settings(TimerMode::None, 10));
         answer(&mut session, 0, 3);
 
+        let q = session.questions[0];
         assert_eq!(
             session.phase(),
             Phase::Feedback {
-                outcome: Outcome::Incorrect
+                outcome: Outcome::Incorrect,
+                question: q,
+                submitted: Some(3)
             }
         );
         assert_eq!(session.correct_count(), 0);
@@ -867,7 +904,9 @@ mod tests {
         assert_eq!(
             session.phase(),
             Phase::Feedback {
-                outcome: Outcome::Correct
+                outcome: Outcome::Correct,
+                question: session.questions[0],
+                submitted: Some(7)
             },
             "nog niet voorbij"
         );
@@ -885,7 +924,9 @@ mod tests {
         assert_eq!(
             session.phase(),
             Phase::Feedback {
-                outcome: Outcome::Correct
+                outcome: Outcome::Correct,
+                question: session.questions[1],
+                submitted: Some(14)
             }
         );
         session.on_key(&Key::Char(' '), 2_010);
@@ -900,7 +941,9 @@ mod tests {
         assert_eq!(
             session.phase(),
             Phase::Feedback {
-                outcome: Outcome::Correct
+                outcome: Outcome::Correct,
+                question: session.questions[2],
+                submitted: Some(21)
             }
         );
         session.on_key(&Key::Enter, third + 30);
@@ -931,6 +974,66 @@ mod tests {
     }
 
     #[test]
+    fn the_verdict_holds_the_whole_screen_still_and_then_gives_a_fresh_clock() {
+        let mut session = session(&table_settings(TimerMode::PerQuestion, 5));
+
+        // Two seconds and a bit into the first question, answered correctly.
+        let submitted = answer(&mut session, 2_100, 7);
+        let answered = session.question_text();
+        let left = session.remaining_ms(submitted).expect("er is een klok");
+        let stage = session.stage(submitted).expect("er is een klok");
+        assert_eq!(
+            Some(left),
+            Some(5_000 - submitted),
+            "vastgezet op het antwoordmoment"
+        );
+
+        // Reading the verdict does not move anything on screen: not the equation
+        // with the submitted answer, not the position in the round, and not the
+        // countdown that was ticking a moment ago.
+        for moment in [1, 600, FEEDBACK_MS - 1] {
+            let now = submitted + moment;
+            session.on_tick(now);
+            assert_eq!(
+                session.question_text(),
+                answered,
+                "dezelfde som en hetzelfde antwoord op {now} ms"
+            );
+            assert_eq!(session.cursor(), 0, "de volgende vraag wacht op {now} ms");
+            assert_eq!(
+                session.remaining_ms(now),
+                Some(left),
+                "de countdown loopt niet door op {now} ms"
+            );
+            assert_eq!(session.stage(now), Some(stage), "op {now} ms");
+        }
+
+        // Then, and only then, the next question with a clock of its own.
+        let next = submitted + FEEDBACK_MS;
+        session.on_tick(next);
+        assert_eq!(session.cursor(), 1);
+        assert_eq!(session.question_text(), "7 × 2 = _");
+        assert_eq!(session.remaining_ms(next), Some(5_000));
+        assert_eq!(session.stage(next), Some(TimerStage::Ok));
+    }
+
+    #[test]
+    fn a_timed_out_question_keeps_its_empty_clock_while_the_verdict_is_up() {
+        let mut session = session(&table_settings(TimerMode::PerQuestion, 5));
+        session.on_tick(5_000);
+
+        assert_eq!(session.question_text(), "7 × 1 = -");
+        assert_eq!(session.remaining_ms(5_000), Some(0));
+        // The clock that ran out does not carry on into negative territory while
+        // the learner reads the answer they should have given.
+        let now = 5_000 + FEEDBACK_MS - 1;
+        session.on_tick(now);
+        assert_eq!(session.question_text(), "7 × 1 = -");
+        assert_eq!(session.remaining_ms(now), Some(0));
+        assert_eq!(session.stage(now), Some(TimerStage::Critical));
+    }
+
+    #[test]
     fn a_question_that_runs_out_of_time_is_recorded_as_too_late() {
         let mut session = session(&table_settings(TimerMode::PerQuestion, 5));
         session.on_tick(4_999);
@@ -940,10 +1043,12 @@ mod tests {
         assert_eq!(
             session.phase(),
             Phase::Feedback {
-                outcome: Outcome::TimedOut
+                outcome: Outcome::TimedOut,
+                question: session.questions[0],
+                submitted: None
             }
         );
-        assert_eq!(session.cursor(), 1);
+        assert_eq!(session.cursor(), 0);
 
         let records = session.take_pending();
         assert_eq!(records.len(), 1);
@@ -951,7 +1056,7 @@ mod tests {
         assert_eq!(records[0].given, None);
         assert_eq!(records[0].response_ms, Some(5_000));
         // The verdict is the one that mentions the right answer.
-        assert_eq!(session.question_text(), "7 × 2 = -");
+        assert_eq!(session.question_text(), "7 × 1 = -");
     }
 
     #[test]
